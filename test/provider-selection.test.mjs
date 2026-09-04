@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -25,6 +25,7 @@ const {
   disableProvider,
   enableProvider,
   providerSelectionStatus,
+  pruneUnconfiguredProviders,
   readProviderSelection,
   readProviderSelectionDetail,
   selectedConfiguredListedModels,
@@ -402,6 +403,227 @@ test("the write path still rejects an unknown provider id", () => {
     );
     assert.deepEqual(readProviderSelectionDetail().ignored, []);
   } finally {
+    rmSync(testRoot, { recursive: true, force: true });
+  }
+});
+
+// --- pruneUnconfiguredProviders ---------------------------------------------------
+
+// The selection file is the dispatch policy, but nothing used to reconcile it
+// with what the build can authenticate: an `enable` that raced the first
+// `provider-key set`, a credential deleted out from under the policy, or an
+// upgrade that renamed a provider each left ids behind whose every request 503s
+// provider_api_key_missing. The service prunes them once at startup, with one
+// log line per id naming the command that puts the provider back.
+test("prune removes a provider the build cannot authenticate and names the restore command", () => {
+  try {
+    stageSelectionFile(`${JSON.stringify({ version: 1, providers: ["deepseek"] })}\n`);
+    const lines = [];
+    const removed = pruneUnconfiguredProviders({ log: (line) => lines.push(line) });
+
+    assert.deepEqual(removed, [{ id: "deepseek", reason: "unconfigured" }]);
+    assert.deepEqual(readProviderSelection(), []);
+    assert.equal(lines.length, 1);
+    assert.match(lines[0], /deepseek/);
+    assert.match(lines[0], /provider-key deepseek set/);
+    // The file and reality now agree, so a second pass changes nothing.
+    const secondPass = [];
+    assert.deepEqual(
+      pruneUnconfiguredProviders({ log: (line) => secondPass.push(line) }),
+      [],
+    );
+    assert.deepEqual(secondPass, []);
+  } finally {
+    rmSync(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("prune keeps providers that can authenticate, including keyless local backends", () => {
+  try {
+    writeProviderCredential("deepseek", "TEST_DEEPSEEK_PRUNE_KEY");
+    stageSelectionFile(`${JSON.stringify({ version: 1, providers: ["deepseek", "lmstudio"] })}\n`);
+    const lines = [];
+    assert.deepEqual(pruneUnconfiguredProviders({ log: (line) => lines.push(line) }), []);
+    assert.deepEqual(lines, []);
+    assert.deepEqual(readProviderSelection(), ["deepseek", "lmstudio"]);
+  } finally {
+    rmSync(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("prune names the sign-in and re-enable commands for an OAuth provider without a session", () => {
+  try {
+    stageSelectionFile(`${JSON.stringify({ version: 1, providers: ["kimi-oauth"] })}\n`);
+    const lines = [];
+    assert.deepEqual(
+      pruneUnconfiguredProviders({ log: (line) => lines.push(line) }),
+      [{ id: "kimi-oauth", reason: "unconfigured" }],
+    );
+    assert.equal(lines.length, 1);
+    assert.match(lines[0], /kimi login/);
+    assert.match(lines[0], /providers enable kimi-oauth/);
+    assert.deepEqual(readProviderSelection(), []);
+  } finally {
+    rmSync(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("prune removes a whole variant family when its shared credential is missing, and keeps it when present", () => {
+  try {
+    stageSelectionFile(`${JSON.stringify({ version: 1, providers: ["opencode-go"] })}\n`);
+    const removed = pruneUnconfiguredProviders({ log: () => {} });
+    assert.deepEqual(removed, [{ id: "opencode-go", reason: "unconfigured" }]);
+    assert.deepEqual(readProviderSelection(), []);
+
+    writeProviderCredential("opencode-go", "TEST_OPENCODE_PRUNE_KEY");
+    stageSelectionFile(`${JSON.stringify({ version: 1, providers: ["opencode-go"] })}\n`);
+    assert.deepEqual(pruneUnconfiguredProviders({ log: () => {} }), []);
+    // The family still expands through the selection read after the rewrite.
+    assert.ok(readProviderSelection().includes("opencode-go-responses"));
+  } finally {
+    rmSync(testRoot, { recursive: true, force: true });
+  }
+});
+
+// Version skew: the file names an id this build no longer ships (renamed,
+// retired, or written by a newer checkout). Such an id can never authenticate,
+// so it leaves the file, and a file that names only such ids rewrites to an
+// explicit empty selection -- an honest "nothing routable" instead of the
+// degraded show-everything fallback.
+test("prune removes ids this build does not recognise and reports them", () => {
+  try {
+    stageSelectionFile(
+      `${JSON.stringify({ version: 1, providers: ["provider-from-a-newer-build"] })}\n`,
+    );
+    const lines = [];
+    const removed = pruneUnconfiguredProviders({ log: (line) => lines.push(line) });
+
+    assert.deepEqual(removed, [{ id: "provider-from-a-newer-build", reason: "unknown" }]);
+    assert.equal(lines.length, 1);
+    assert.match(lines[0], /provider-from-a-newer-build/);
+    assert.match(lines[0], /setup --guided/);
+    // The rewrite must not reopen every provider.
+    assert.deepEqual(readProviderSelection(), []);
+    assert.deepEqual(
+      JSON.parse(readFileSync(PROVIDER_SELECTION_PATH, "utf8")).providers,
+      [],
+    );
+  } finally {
+    rmSync(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("prune handles a mixed file: unknown and unconfigured ids leave, configured ids stay", () => {
+  try {
+    writeProviderCredential("deepseek", "TEST_DEEPSEEK_PRUNE_KEY");
+    stageSelectionFile(
+      `${JSON.stringify({
+        version: 1,
+        providers: ["deepseek", "kimi-api", "provider-from-a-newer-build"],
+      })}\n`,
+    );
+    const lines = [];
+    const removed = pruneUnconfiguredProviders({ log: (line) => lines.push(line) });
+
+    assert.deepEqual(removed, [
+      { id: "provider-from-a-newer-build", reason: "unknown" },
+      { id: "kimi-api", reason: "unconfigured" },
+    ]);
+    assert.equal(lines.length, 2);
+    assert.deepEqual(readProviderSelection(), ["deepseek"]);
+  } finally {
+    rmSync(testRoot, { recursive: true, force: true });
+  }
+});
+
+// A reconciliation must never clobber a file it cannot parse: an unreadable or
+// wrong-version selection stays byte-for-byte for the doctor to report.
+test("prune leaves an unreadable or invalid selection file untouched", () => {
+  try {
+    const broken = "{ not json at all";
+    stageSelectionFile(broken);
+    const lines = [];
+    assert.deepEqual(pruneUnconfiguredProviders({ log: (line) => lines.push(line) }), []);
+    assert.deepEqual(lines, []);
+    assert.equal(readFileSync(PROVIDER_SELECTION_PATH, "utf8"), broken);
+
+    stageSelectionFile(`${JSON.stringify({ version: 99, providers: ["deepseek"] })}\n`);
+    assert.deepEqual(pruneUnconfiguredProviders({ log: () => {} }), []);
+    assert.equal(JSON.parse(readFileSync(PROVIDER_SELECTION_PATH, "utf8")).version, 99);
+  } finally {
+    rmSync(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("prune is a no-op without a selection file and under --no-discovery", () => {
+  try {
+    // No file: the picker defaults are already credential-aware.
+    assert.deepEqual(pruneUnconfiguredProviders({ log: () => {} }), []);
+    assert.equal(existsSync(PROVIDER_SELECTION_PATH), false);
+
+    // Under --no-discovery nothing counts as configured by design, so pruning
+    // would erase every selection the operator made -- including keyless local
+    // backends that read no credential. The idle-install promise already hides
+    // unconfigured providers, so the file is left alone.
+    process.env.CODEX_ROUTER_NO_DISCOVERY = "1";
+    try {
+      stageSelectionFile(`${JSON.stringify({ version: 1, providers: ["deepseek", "local"] })}\n`);
+      const before = readFileSync(PROVIDER_SELECTION_PATH, "utf8");
+      assert.deepEqual(pruneUnconfiguredProviders({ log: () => {} }), []);
+      assert.equal(readFileSync(PROVIDER_SELECTION_PATH, "utf8"), before);
+    } finally {
+      delete process.env.CODEX_ROUTER_NO_DISCOVERY;
+    }
+  } finally {
+    rmSync(testRoot, { recursive: true, force: true });
+  }
+});
+
+// The show-all-models override changes what the picker shows, not what the
+// durable policy file means. Prune reads the file itself, so the override does
+// not suspend reconciliation -- when the override is removed, the file must
+// already match what the build can authenticate.
+test("prune still reconciles the file while the show-all-models override is set", () => {
+  try {
+    process.env.MODEL_ROUTER_SHOW_ALL_MODELS = "1";
+    try {
+      stageSelectionFile(`${JSON.stringify({ version: 1, providers: ["deepseek"] })}\n`);
+      assert.deepEqual(
+        pruneUnconfiguredProviders({ log: () => {} }),
+        [{ id: "deepseek", reason: "unconfigured" }],
+      );
+      assert.deepEqual(
+        JSON.parse(readFileSync(PROVIDER_SELECTION_PATH, "utf8")).providers,
+        [],
+      );
+    } finally {
+      delete process.env.MODEL_ROUTER_SHOW_ALL_MODELS;
+    }
+  } finally {
+    rmSync(testRoot, { recursive: true, force: true });
+  }
+});
+
+// A provider whose API-key pool is authoritative but unusable cannot
+// authenticate even when a legacy key exists, so prune removes it and names
+// both repair steps: fix the pool, then re-enable (unlike `provider-key set`,
+// which re-enables on its own).
+test("prune names the pool repair and re-enable steps when the authoritative pool is unusable", async () => {
+  try {
+    process.env.OPENCODE_API_KEY = "TEST_POOL_PRUNE_KEY";
+    await addEnvironmentCredentialToPool("opencode-go", "OPENCODE_API_KEY");
+    delete process.env.OPENCODE_API_KEY;
+    stageSelectionFile(`${JSON.stringify({ version: 1, providers: ["opencode-go"] })}\n`);
+    const lines = [];
+    const removed = pruneUnconfiguredProviders({ log: (line) => lines.push(line) });
+
+    assert.deepEqual(removed, [{ id: "opencode-go", reason: "unconfigured" }]);
+    assert.equal(lines.length, 1);
+    assert.match(lines[0], /provider API-key pool/);
+    assert.match(lines[0], /providers enable opencode-go/);
+    assert.deepEqual(readProviderSelection(), []);
+  } finally {
+    delete process.env.OPENCODE_API_KEY;
     rmSync(testRoot, { recursive: true, force: true });
   }
 });

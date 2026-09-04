@@ -19,6 +19,7 @@ import { SHUTDOWN_DRAIN_MS, SHUTDOWN_FLUSH_MS } from "./http-utils.mjs";
 import { waitForHealth as pollHealth } from "./health-probe.mjs";
 import { gatewaySupervisorLimits, superviseGateway } from "./gateway-supervisor.mjs";
 import { writeLiteLlmConfig } from "./litellm-config.mjs";
+import { pruneUnconfiguredProviders } from "./provider-selection.mjs";
 import { MODELS } from "./model-registry.mjs";
 import { readLocalModelSelection } from "./local-models.mjs";
 import { antigravityOAuthStartupState } from "./antigravity-oauth-status.mjs";
@@ -121,6 +122,14 @@ const callerKey = assertCallerSecret(
   readFileSync(CALLER_SECRET_PATH, "utf8").trim(),
 );
 writeLiteLlmConfig();
+
+// The selection file is the dispatch policy, and it can drift from what the
+// build can authenticate: an `enable` that raced the first `provider-key set`,
+// a credential deleted out from under the policy, or an upgrade that renamed a
+// provider. Reconcile it before anything starts serving so the picker stops
+// advertising providers whose every request would 503 provider_api_key_missing.
+// One line per removed id names the command that puts the provider back.
+pruneUnconfiguredProviders();
 
 // A checked local model means the operator intends to route through Ollama,
 // so keep its daemon available for the gateway. This never installs software

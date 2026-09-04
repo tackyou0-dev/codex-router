@@ -247,6 +247,117 @@ export function disableProvider(providerId) {
   );
 }
 
+// The setup an operator follows to put a pruned provider back. API-key
+// providers are one command: `provider-key <id> set` stores the credential and
+// re-enables the provider in the same transaction. OAuth providers sign in
+// through their own CLI (or the router's login command) and then need an
+// explicit re-enable, so the hint names both steps.
+function restoreHintForProvider(id, { fallback } = {}) {
+  const provider = RUNTIME_PROVIDERS.get(id);
+  if (!provider) return fallback;
+  if (provider.kind === "oauth") {
+    let setup;
+    if (id === "kimi-oauth") setup = kimiOAuthStatus().setup;
+    else if (id === "grok-oauth") setup = grokOAuthStatus().setup;
+    else if (id === "antigravity-oauth") setup = antigravityOAuthStatus().setup;
+    else if (id === "devin-cli") setup = devinCliStatus().setup;
+    const signIn = setup || `Run ${targetCli("setup --guided")}`;
+    return `${signIn.replace(/\.$/, "")}; then run ${targetCli(`providers enable ${id}`)} to put it back.`;
+  }
+  // Keyless, anonymous, and per-model providers can never be pruned -- they
+  // count as configured by definition -- so the provider-key path below is
+  // only ever offered for providers that actually take a key.
+  const status = effectiveProviderCredentialStatus(provider, { persistent: true });
+  if (status.setup) {
+    // A legacy-key provider is put back by the one command that also
+    // re-enables it (`provider-key set`). A pooled provider is fixed by
+    // repairing the pool, which does not re-enable, so name that step too.
+    return status.pooled
+      ? `${status.setup}; then run ${targetCli(`providers enable ${id}`)} to put it back.`
+      : status.setup;
+  }
+  return `Run ${targetCli(`provider-key ${id} set`)} to put it back.`;
+}
+
+// Reconcile enabled-providers.json with what this build can actually
+// authenticate. The file is the dispatch policy: it decides what the picker
+// advertises and what the forwarder answers for, and nothing else rewrites it
+// when reality drifts -- an `enable` that raced the first `provider-key <id>
+// set`, a credential deleted out from under the policy, or an upgrade that
+// renamed or retired a provider each leave ids in the file whose every request
+// comes back 503 `provider_api_key_missing`. The service prunes those ids once
+// at startup; each logged line names the command that puts the provider back.
+//
+// Returns the removed ids so tests and callers can report what changed.
+export function pruneUnconfiguredProviders({ log = console.error } = {}) {
+  if (!existsSync(PROVIDER_SELECTION_PATH)) return [];
+  // Under --no-discovery nothing counts as configured by design, so pruning
+  // would erase every selection the operator made (including keyless local
+  // backends that read no credential at all). The idle-install promise already
+  // keeps unconfigured providers out of the picker; leave the file alone and
+  // let the next setup run decide.
+  if (discoveryDisabled()) return [];
+  // Read the file directly rather than through `readProviderSelectionDetail()`:
+  // the detail reader's degraded fallbacks (SHOW_ALL_MODELS, an all-unknown
+  // file) substitute provider lists that are not what the operator wrote, and
+  // a reconciliation must never clobber a file it cannot parse. An unreadable
+  // or invalid selection is the doctor's surface and stays byte-for-byte here.
+  let parsed;
+  try {
+    parsed = JSON.parse(readFileSync(PROVIDER_SELECTION_PATH, "utf8"));
+  } catch {
+    return [];
+  }
+  if (parsed?.version !== 1 || !Array.isArray(parsed.providers)) return [];
+  const { known, unknown } = filterKnownProviderIds(parsed.providers);
+  const configured = new Set(configuredProviderIds());
+  const removed = [];
+  const keep = [];
+  // An id this build does not recognise can never be authenticated, so it
+  // always leaves the file. A file that names only such ids rewrites to an
+  // explicit empty selection -- an honest "nothing routable" rather than the
+  // degraded show-everything fallback.
+  for (const id of unknown) removed.push({ id, reason: "unknown" });
+  // Judge the file at its own grain: it stores canonical ids, and a protocol
+  // variant family shares its parent's credential, so one decision (and one
+  // log line) per stored id is enough. The read path expands whatever is kept
+  // back into the family.
+  for (const id of known) {
+    if (configured.has(id)) keep.push(id);
+    else removed.push({ id, reason: "unconfigured" });
+  }
+  if (removed.length === 0) return [];
+  try {
+    writeProviderSelection(keep);
+  } catch (error) {
+    // The stale file is survivable -- the credential-aware catalog still hides
+    // what cannot authenticate -- so a failed reconcile is a warning, not a
+    // reason to take the service down before it starts.
+    log(
+      `[model-router] Could not reconcile ${PROVIDER_SELECTION_PATH}: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    );
+    return [];
+  }
+  for (const entry of removed) {
+    if (entry.reason === "unknown") {
+      log(
+        `[model-router] Removed ${entry.id} from enabled-providers.json: this build does not recognise it. ` +
+          `Run ${targetCli("setup --guided")} to rewrite the selection with this build's providers.`,
+      );
+    } else {
+      log(
+        `[model-router] Removed ${entry.id} from enabled-providers.json: no configured credential. ` +
+          restoreHintForProvider(entry.id, {
+            fallback: `Run ${targetCli("setup --guided")} to put it back.`,
+          }),
+      );
+    }
+  }
+  return removed;
+}
+
 export function selectedListedModels() {
   const selected = new Set(readProviderSelection());
   return LISTED_MODELS.filter((model) => (

@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- **The provider selection file is now reconciled with what the build can
+  actually authenticate on every service start.** `enabled-providers.json` is
+  the dispatch policy — it decides what the picker advertises and what the
+  forwarder answers for — but nothing used to rewrite it when reality drifted,
+  so an `enable` that raced the first `provider-key <id> set`, a credential
+  deleted out from under the policy, or an upgrade that renamed or retired a
+  provider each left ids in the file whose every request came back 503
+  `provider_api_key_missing`. `pruneUnconfiguredProviders()` runs once at
+  startup, removes every selected id that lacks a configured credential (and
+  every id this build no longer recognises), and logs one line per removed id
+  naming the exact command that puts the provider back. Unreadable or invalid
+  files, installs without a selection file, and `--no-discovery` installs are
+  left untouched, and a failed reconcile warns instead of taking the service
+  down. (Fixes #589)
+
 - **Routed reasoning models no longer leak `<think>` chains into the visible
   answer.** Qwen (and other reasoning models bridged through LiteLLM's
   chat-completions path) sometimes emit their chain-of-thought inline in the
